@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GovMap Known Layers Test</title>
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://www.govmap.gov.il/govmap/api/govmap.api.js"></script>
+<style>
+body{font-family:Arial,sans-serif;margin:18px;background:#f7f7f7;color:#111}
+.card{background:#fff;border:1px solid #ddd;border-radius:10px;padding:14px;margin:12px 0}
+input,textarea,button{font:inherit} input[type=password]{width:min(720px,95%);padding:9px}
+textarea{width:min(900px,95%);height:105px;padding:9px}
+button{padding:9px 14px;margin:4px;cursor:pointer}
+table{border-collapse:collapse;width:100%;font-size:13px;background:white}
+th,td{border:1px solid #ddd;padding:7px;vertical-align:top;text-align:right}
+th{background:#eee;position:sticky;top:0}
+.ok{color:#087a28;font-weight:bold}.bad{color:#b00020;font-weight:bold}.warn{color:#9a6500;font-weight:bold}
+.mono{font-family:Consolas,monospace;direction:ltr;text-align:left;white-space:pre-wrap;word-break:break-word}
+#map{height:300px;border:1px solid #ccc;margin-top:10px}
+#details{max-height:520px;overflow:auto;background:#111;color:#eee;padding:10px}
+.small{font-size:12px;color:#555}
+.layer-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:7px}
+</style>
+</head>
+<body>
+
+<h1>GovMap - Known Layers Test</h1>
+
+<div class="card">
+  <div><b>Origin:</b> <span id="origin"></span></div>
+  <div class="small">הדף מיועד לרוץ מתוך https://ronmarom12.github.io</div>
+  <p><b>Token:</b><br><input id="token" type="password" autocomplete="off" placeholder="הדבק כאן את ה-token"></p>
+  <button onclick="initGovMap()">1. אתחל GovMap + בדוק Geocode</button>
+  <span id="initStatus"></span>
+  <div id="map"></div>
+</div>
+
+<div class="card">
+  <h2>שכבות ודאיות לבדיקה</h2>
+  <div class="layer-grid" id="layersBox"></div>
+  <p class="small">השמות הטכניים נשלחים ישירות ל-govmap.getLayerData(). אין כאן IDs משוערים של תחנות רכבת או צמתים מרומזרים.</p>
+</div>
+
+<div class="card">
+  <h2>כתובות בדיקה</h2>
+  <textarea id="addresses">דיזנגוף 100 תל אביב
+יפו 97 ירושלים
+הרצל 1 חיפה
+רגר 2 באר שבע</textarea>
+  <p>
+    רדיוסים:
+    <label><input type="checkbox" class="radius" value="250" checked> 250m</label>
+    <label><input type="checkbox" class="radius" value="1000" checked> 1000m</label>
+    <label><input type="checkbox" class="radius" value="2500" checked> 2500m</label>
+  </p>
+  <button onclick="runAll()">2. הרץ את כל הבדיקות</button>
+  <button onclick="downloadReport()">הורד JSON</button>
+  <span id="runStatus"></span>
+</div>
+
+<div class="card">
+<h2>סיכום</h2>
+<div style="overflow:auto;max-height:650px">
+<table>
+<thead>
+<tr>
+<th>שכבה</th><th>LayerName</th><th>כתובת</th><th>רדיוס</th><th>סטטוס</th><th>מס' תוצאות</th><th>שדות ראשונים</th>
+</tr>
+</thead>
+<tbody id="summary"></tbody>
+</table>
+</div>
+</div>
+
+<div class="card">
+<h2>פרטים מלאים</h2>
+<div class="small">לחיצה על שורה בטבלה תציג כאן את ה-JSON המלא שהחזיר GovMap.</div>
+<pre id="details" class="mono"></pre>
+</div>
+
+<script>
+document.getElementById("origin").textContent = window.location.origin;
+
+const LAYERS = [
+  {label:"תחנות אוטובוס", name:"bus_stops"},
+  {label:"מקלטים / מרחבים מוגנים", name:"BOMBSHELTERS"},
+  {label:"דפיברילטורים", name:"DEFI"},
+  {label:"תחנות דלק", name:"GASSTATIONS"},
+  {label:"מסעדות", name:"restaurants"},
+  {label:"פחים כתומים", name:"orange_trash"}
+];
+
+let REPORT = {
+  createdAt:null,
+  origin:window.location.origin,
+  init:null,
+  geocodes:{},
+  tests:[]
+};
+
+for(const l of LAYERS){
+  const d=document.createElement("label");
+  d.innerHTML=`<input type="checkbox" class="layerCheck" value="${l.name}" checked> <b>${l.label}</b> <span class="mono">${l.name}</span>`;
+  document.getElementById("layersBox").appendChild(d);
+}
+
+function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+
+async function initGovMap(){
+  const token=document.getElementById("token").value.trim();
+  if(!token){alert("הדבק token קודם");return;}
+  const st=document.getElementById("initStatus");
+  st.textContent="בודק...";
+  try{
+    await govmap.createMap("map",{
+      token,
+      showXY:true,
+      identifyOnClick:true,
+      isEmbeddedToggle:false
+    });
+    const g=await govmap.geocode({keyword:"דיזנגוף 100 תל אביב"},govmap.geocodeType.FullResult);
+    REPORT.init={ok:true};
+    REPORT.geocodes["init"]=g;
+    st.innerHTML='<span class="ok">SUCCESS - SDK + Geocode</span>';
+  }catch(e){
+    REPORT.init={ok:false,error:String(e)};
+    st.innerHTML='<span class="bad">FAILED: '+esc(e)+'</span>';
+  }
+}
+
+async function geocodeAddress(address){
+  try{
+    const g=await govmap.geocode({keyword:address},govmap.geocodeType.FullResult);
+    const first=g?.data?.[0];
+    if(!first) return {ok:false,error:"No geocode result",raw:g};
+    return {ok:true,x:first.X,y:first.Y,label:first.ResultLable,raw:g};
+  }catch(e){
+    return {ok:false,error:String(e)};
+  }
+}
+
+function countResults(resp){
+  if(!resp) return 0;
+  if(Array.isArray(resp.data)) return resp.data.length;
+  if(Array.isArray(resp)) return resp.length;
+  return 0;
+}
+
+function extractFields(resp){
+  const item=Array.isArray(resp?.data) ? resp.data[0] : null;
+  if(!item) return [];
+  if(Array.isArray(item.Fields)){
+    return item.Fields.slice(0,12).map(f => {
+      const n=f?.Name ?? f?.FieldName ?? f?.Key ?? "?";
+      const v=f?.Value ?? f?.FieldValue ?? "";
+      return `${n}=${v}`;
+    });
+  }
+  return Object.keys(item).slice(0,12);
+}
+
+async function testLayer(layer, geo, radius){
+  try{
+    const resp=await govmap.getLayerData({
+      LayerName:layer.name,
+      Point:{x:geo.x,y:geo.y},
+      Radius:radius
+    });
+    return {
+      ok:true,
+      count:countResults(resp),
+      fields:extractFields(resp),
+      raw:resp
+    };
+  }catch(e){
+    return {ok:false,count:0,fields:[],error:String(e)};
+  }
+}
+
+function addRow(t){
+  const tr=document.createElement("tr");
+  tr.style.cursor="pointer";
+  tr.onclick=()=>document.getElementById("details").textContent=JSON.stringify(t,null,2);
+  tr.innerHTML=`
+    <td>${esc(t.layerLabel)}</td>
+    <td class="mono">${esc(t.layerName)}</td>
+    <td>${esc(t.address)}</td>
+    <td>${esc(t.radius)}m</td>
+    <td class="${t.ok?"ok":"bad"}">${t.ok?"SUCCESS":"FAILED"}</td>
+    <td>${t.count}</td>
+    <td class="mono">${esc((t.fields||[]).join("\n"))}</td>`;
+  document.getElementById("summary").appendChild(tr);
+}
+
+async function runAll(){
+  const token=document.getElementById("token").value.trim();
+  if(!token){alert("הדבק token ואתחל קודם");return;}
+
+  const selectedNames=[...document.querySelectorAll(".layerCheck:checked")].map(x=>x.value);
+  const selectedLayers=LAYERS.filter(x=>selectedNames.includes(x.name));
+  const addresses=document.getElementById("addresses").value.split("\n").map(x=>x.trim()).filter(Boolean);
+  const radii=[...document.querySelectorAll(".radius:checked")].map(x=>Number(x.value));
+
+  if(!selectedLayers.length || !addresses.length || !radii.length){
+    alert("בחר שכבה, כתובת ורדיוס"); return;
+  }
+
+  REPORT.createdAt=new Date().toISOString();
+  REPORT.tests=[];
+  REPORT.geocodes={};
+  document.getElementById("summary").innerHTML="";
+  document.getElementById("details").textContent="";
+  const st=document.getElementById("runStatus");
+  st.textContent="מריץ...";
+
+  const geos=[];
+  for(const address of addresses){
+    const g=await geocodeAddress(address);
+    REPORT.geocodes[address]=g;
+    geos.push({address,g});
+    await sleep(300);
+  }
+
+  let done=0;
+  const total=selectedLayers.length*geos.length*radii.length;
+
+  for(const layer of selectedLayers){
+    for(const {address,g} of geos){
+      if(!g.ok){
+        for(const radius of radii){
+          const t={layerLabel:layer.label,layerName:layer.name,address,radius,ok:false,count:0,fields:[],error:"Geocode failed: "+g.error};
+          REPORT.tests.push(t); addRow(t); done++;
+        }
+        continue;
+      }
+
+      for(const radius of radii){
+        const r=await testLayer(layer,g,radius);
+        const t={
+          layerLabel:layer.label,
+          layerName:layer.name,
+          address,
+          geocodedAs:g.label,
+          x:g.x,y:g.y,
+          radius,
+          ...r
+        };
+        REPORT.tests.push(t);
+        addRow(t);
+        done++;
+        st.textContent=`מריץ ${done}/${total}...`;
+        await sleep(350);
+      }
+    }
+  }
+  st.innerHTML='<span class="ok">DONE</span>';
+}
+
+function downloadReport(){
+  const blob=new Blob([JSON.stringify(REPORT,null,2)],{type:"application/json;charset=utf-8"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download="govmap-known-layers-report.json";
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+</script>
+</body>
+</html>
