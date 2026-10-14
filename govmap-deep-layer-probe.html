@@ -1,0 +1,837 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GovMap Deep Layer Probe</title>
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://www.govmap.gov.il/govmap/api/govmap.api.js"></script>
+<style>
+body{font-family:Arial,sans-serif;margin:18px;background:#f6f7f9;color:#111}
+h1,h2,h3{margin:0 0 10px}
+.card{background:#fff;border:1px solid #d9dde3;border-radius:10px;padding:14px;margin:12px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}
+input,textarea,select,button{font:inherit}
+input[type=text],input[type=password],input[type=number],select{padding:8px;width:min(760px,95%);box-sizing:border-box}
+textarea{width:min(1000px,96%);height:90px;padding:8px;box-sizing:border-box}
+button{padding:9px 14px;margin:4px;cursor:pointer;border:1px solid #bbb;border-radius:7px;background:#fff}
+button.primary{background:#1769e0;color:#fff;border-color:#1769e0}
+button:disabled{opacity:.5;cursor:not-allowed}
+table{border-collapse:collapse;width:100%;font-size:12.5px;background:#fff}
+th,td{border:1px solid #d8d8d8;padding:7px;vertical-align:top;text-align:right}
+th{background:#eef1f5;position:sticky;top:0;z-index:1}
+.ok{color:#087a28;font-weight:bold}.bad{color:#b00020;font-weight:bold}.warn{color:#9a6500;font-weight:bold}
+.mono{font-family:Consolas,monospace;direction:ltr;text-align:left;white-space:pre-wrap;word-break:break-word}
+.small{font-size:12px;color:#555}
+#map{height:330px;border:1px solid #c9c9c9;margin-top:10px}
+#log,#raw{max-height:420px;overflow:auto;background:#101214;color:#eee;padding:10px;border-radius:6px}
+.layer{border:1px solid #ddd;border-radius:8px;padding:9px;background:#fafafa}
+.badge{display:inline-block;border-radius:12px;padding:2px 7px;background:#eee;margin:2px;font-size:11px}
+.progress{height:10px;background:#e9ecef;border-radius:7px;overflow:hidden;margin:8px 0}
+.progress>div{height:100%;background:#1769e0;width:0%}
+details{margin:8px 0}
+summary{cursor:pointer;font-weight:bold}
+</style>
+</head>
+<body>
+
+<h1>GovMap Deep Layer Probe</h1>
+<p class="small">בדיקה עמוקה של שכבות ידועות דרך ה-JavaScript API הרשמי מהדומיין המאושר. הכל רץ סדרתית ובקצב מוגבל כדי להפחית סיכוי ל-Rate Limit.</p>
+
+<div class="card">
+  <h2>1. אתחול</h2>
+  <div><b>Origin:</b> <span id="origin"></span></div>
+  <p><b>Token:</b><br><input id="token" type="password" autocomplete="off" placeholder="הדבק כאן את ה-token"></p>
+  <button class="primary" onclick="initGovMap()">אתחל GovMap + בדוק Geocode</button>
+  <span id="initStatus"></span>
+  <div id="map"></div>
+</div>
+
+<div class="card">
+  <h2>2. שכבות לבדיקה</h2>
+  <div id="layerBoxes" class="grid"></div>
+</div>
+
+<div class="card">
+  <h2>3. מצב בדיקה</h2>
+  <div class="grid">
+    <div>
+      <b>בדיקה סביב כתובת אחת</b><br>
+      <input id="address" type="text" value="דיזנגוף 100 תל אביב">
+      <br><br>
+      <b>רדיוס במטרים</b><br>
+      <input id="radius" type="number" min="10" max="3000" value="250">
+    </div>
+    <div>
+      <b>השהיה מינימלית בין קריאות</b><br>
+      <input id="delayMs" type="number" min="500" max="10000" value="2000"> ms
+      <p class="small">אם GovMap מציג הודעת עומס, הכלי יוסיף המתנה ארוכה וינסה שוב פעם אחת.</p>
+      <label><input id="tryAllAliases" type="checkbox" checked> נסה גם aliases חלופיים לכל שכבה</label><br>
+      <label><input id="doIntersect" type="checkbox" checked> בדוק intersectFeatures עם getShapes=true</label><br>
+      <label><input id="doSelect" type="checkbox" checked> בדוק selectFeaturesOnMap עם getWkt=true</label><br>
+      <label><input id="doIdentify" type="checkbox" checked> אם נמצאת קואורדינטה, בדוק identifyByXYAndLayer</label>
+    </div>
+  </div>
+
+  <p>
+    <button class="primary" onclick="runPointDeepTest()">בדיקה עמוקה סביב הכתובת</button>
+    <button onclick="runRecommendedDiscovery()">בדיקת גילוי חיובית לכל שכבה</button>
+    <button onclick="downloadJson()">הורד JSON מלא</button>
+    <button onclick="downloadCsv()">הורד CSV של ישויות שחולצו</button>
+  </p>
+
+  <div class="progress"><div id="progressBar"></div></div>
+  <span id="runStatus"></span>
+</div>
+
+<div class="card">
+  <h2>4. תמונת מצב</h2>
+  <div style="overflow:auto;max-height:650px">
+    <table>
+      <thead>
+        <tr>
+          <th>שכבה</th>
+          <th>Alias שעבד</th>
+          <th>כתובת</th>
+          <th>רדיוס</th>
+          <th>getLayerData</th>
+          <th>intersectFeatures</th>
+          <th>selectFeaturesOnMap</th>
+          <th>XY/WKT שנמצאו</th>
+          <th>Object IDs</th>
+          <th>שדות שנמצאו</th>
+          <th>הערות</th>
+        </tr>
+      </thead>
+      <tbody id="summary"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>5. ישויות שחולצו</h2>
+  <div class="small">הטבלה מאחדת מידע מכל השיטות. המטרה היא לראות האם ניתן לקבל קואורדינטה ישירה, WKT/Shape, מזהה אובייקט, מרחק וכל מאפיין אחר.</div>
+  <div style="overflow:auto;max-height:750px">
+    <table>
+      <thead>
+        <tr>
+          <th>שכבה</th>
+          <th>שיטה</th>
+          <th>Alias</th>
+          <th>#</th>
+          <th>Distance</th>
+          <th>Coordinates</th>
+          <th>WKT/Shape</th>
+          <th>IDs</th>
+          <th>Fields / properties</th>
+        </tr>
+      </thead>
+      <tbody id="entities"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>6. פרטי שורה</h2>
+  <div class="small">לחץ על שורה בטבלאות כדי לראות את ה-JSON המלא.</div>
+  <pre id="raw" class="mono"></pre>
+</div>
+
+<div class="card">
+  <h2>7. לוג</h2>
+  <pre id="log" class="mono"></pre>
+</div>
+
+<script>
+document.getElementById("origin").textContent = window.location.origin;
+
+const LAYERS = [
+  {
+    key:"bus",
+    label:"תחנות אוטובוס",
+    aliases:["bus_stops","20","layer_20"],
+    numericId:"20",
+    recommendedAddress:"דיזנגוף 100 תל אביב",
+    recommendedRadius:250
+  },
+  {
+    key:"shelters",
+    label:"מקלטים / מרחבים מוגנים",
+    aliases:["BOMBSHELTERS","228056","layer_228056"],
+    numericId:"228056",
+    recommendedAddress:"דיזנגוף 100 תל אביב",
+    recommendedRadius:250
+  },
+  {
+    key:"defi",
+    label:"דפיברילטורים",
+    aliases:["224727","layer_224727","DEFI"],
+    numericId:"224727",
+    recommendedAddress:"איכילוב תל אביב",
+    recommendedRadius:1500
+  },
+  {
+    key:"gas",
+    label:"תחנות דלק",
+    aliases:["GASSTATIONS","228306","layer_228306","gasstations"],
+    numericId:"228306",
+    recommendedAddress:"דיזנגוף 100 תל אביב",
+    recommendedRadius:1000
+  },
+  {
+    key:"restaurants",
+    label:"מסעדות",
+    aliases:["restaurants","388","layer_388"],
+    numericId:"388",
+    recommendedAddress:"דיזנגוף 100 תל אביב",
+    recommendedRadius:250
+  },
+  {
+    key:"orange",
+    label:"פחים כתומים",
+    aliases:["200718","layer_200718","orange_trash","ORANGE_TRASH"],
+    numericId:"200718",
+    recommendedAddress:"קדימה צורן",
+    recommendedRadius:2500
+  }
+];
+
+let REPORT = {
+  startedAt:null,
+  origin:window.location.origin,
+  sdkFunctions:{},
+  init:null,
+  tests:[],
+  entities:[]
+};
+
+const INTERESTING_FUNCS = [
+  "createMap","geocode","getLayerData","intersectFeatures",
+  "selectFeaturesOnMap","identifyByXYAndLayer","identifyByXY",
+  "getLayerEntities","setVisibleLayers","zoomToXY","searchInLayer",
+  "filterLayers","getMapUrl"
+];
+
+for(const f of INTERESTING_FUNCS){
+  REPORT.sdkFunctions[f] = typeof govmap?.[f];
+}
+
+function layerBox(layer){
+  return `
+  <div class="layer">
+    <label><input type="checkbox" class="layerCheck" value="${layer.key}" checked> <b>${layer.label}</b></label>
+    <div class="small">Layer ID: <span class="mono">${layer.numericId}</span></div>
+    <div class="small">Aliases: ${layer.aliases.map(a=>`<span class="badge mono">${a}</span>`).join("")}</div>
+    <button onclick="visualizeLayer('${layer.key}')">הצג שכבה במפה</button>
+  </div>`;
+}
+document.getElementById("layerBoxes").innerHTML = LAYERS.map(layerBox).join("");
+
+function esc(s){
+  return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+function now(){return new Date().toISOString();}
+function log(msg){
+  const e=document.getElementById("log");
+  e.textContent += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+  e.scrollTop=e.scrollHeight;
+}
+
+function promiseTimeout(p, ms, label){
+  return Promise.race([
+    p,
+    new Promise((_,reject)=>setTimeout(()=>reject(new Error(`Timeout after ${ms}ms: ${label}`)),ms))
+  ]);
+}
+
+let lastCallAt=0;
+async function pace(extra=0){
+  const minDelay=Math.max(500,Number(document.getElementById("delayMs").value)||2000);
+  const wait=Math.max(0,(lastCallAt+minDelay+extra)-Date.now());
+  if(wait>0) await sleep(wait);
+  lastCallAt=Date.now();
+}
+
+function isThrottleError(e){
+  const s=String(e||"").toLowerCase();
+  return s.includes("429") || s.includes("too many") || s.includes("rate") ||
+         s.includes("יותר מדי") || s.includes("המתן") || s.includes("עומס");
+}
+
+async function safeSdkCall(label, fn, retry=true){
+  await pace();
+  const t0=performance.now();
+  try{
+    const result=await promiseTimeout(Promise.resolve().then(fn),30000,label);
+    const ms=Math.round(performance.now()-t0);
+    log(`${label}: OK (${ms} ms)`);
+    return {ok:true,ms,result};
+  }catch(e){
+    const ms=Math.round(performance.now()-t0);
+    log(`${label}: FAILED (${ms} ms): ${e}`);
+    if(retry && isThrottleError(e)){
+      log(`${label}: suspected rate limit, waiting 12 seconds before one retry`);
+      await sleep(12000);
+      return safeSdkCall(label+" [retry]",fn,false);
+    }
+    return {ok:false,ms,error:String(e)};
+  }
+}
+
+async function initGovMap(){
+  const token=document.getElementById("token").value.trim();
+  if(!token){alert("הדבק token קודם");return;}
+  const s=document.getElementById("initStatus");
+  s.textContent="בודק...";
+  REPORT.startedAt=now();
+  try{
+    await govmap.createMap("map",{token,showXY:true,identifyOnClick:true,isEmbeddedToggle:false});
+    const g=await safeSdkCall("geocode init",()=>govmap.geocode({keyword:"דיזנגוף 100 תל אביב"},govmap.geocodeType.FullResult));
+    REPORT.init={ok:g.ok,geocode:g};
+    s.innerHTML=g.ok?'<span class="ok">SUCCESS</span>':'<span class="bad">GEOCODE FAILED</span>';
+  }catch(e){
+    REPORT.init={ok:false,error:String(e)};
+    s.innerHTML='<span class="bad">INIT FAILED</span>';
+  }
+}
+
+async function geocodeAddress(address){
+  const r=await safeSdkCall(`geocode ${address}`,()=>govmap.geocode({keyword:address},govmap.geocodeType.FullResult));
+  if(!r.ok) return {ok:false,error:r.error,raw:r};
+  const first=r.result?.data?.[0];
+  if(!first) return {ok:false,error:"No geocode result",raw:r.result};
+  return {ok:true,x:Number(first.X),y:Number(first.Y),label:first.ResultLable,raw:r.result};
+}
+
+function selectedLayers(){
+  const keys=[...document.querySelectorAll(".layerCheck:checked")].map(x=>x.value);
+  return LAYERS.filter(l=>keys.includes(l.key));
+}
+
+function selectedAliases(layer){
+  return document.getElementById("tryAllAliases").checked ? layer.aliases : [layer.aliases[0]];
+}
+
+function recursiveFind(obj, predicate, path="$", out=[]){
+  if(obj===null || obj===undefined) return out;
+  if(typeof obj!=="object") return out;
+  if(Array.isArray(obj)){
+    obj.forEach((v,i)=>recursiveFind(v,predicate,`${path}[${i}]`,out));
+    return out;
+  }
+  for(const [k,v] of Object.entries(obj)){
+    const p=`${path}.${k}`;
+    try{ if(predicate(k,v,p,obj)) out.push({path:p,key:k,value:v,parent:obj}); }catch{}
+    if(v && typeof v==="object") recursiveFind(v,predicate,p,out);
+  }
+  return out;
+}
+
+function parseWktPoint(s){
+  if(typeof s!=="string") return null;
+  const m=s.match(/POINT\s*\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)/i);
+  return m?{x:Number(m[1]),y:Number(m[2]),raw:s}:null;
+}
+
+function collectWkts(obj){
+  const vals=[];
+  recursiveFind(obj,(k,v)=>{
+    if(typeof v==="string" && /(POINT|LINESTRING|POLYGON|MULTI)/i.test(v)){
+      vals.push(v);
+    }
+    return false;
+  });
+  return [...new Set(vals)];
+}
+
+function collectIds(obj){
+  const vals=[];
+  recursiveFind(obj,(k,v)=>{
+    if(/(^|_)(objectid|object_id|oid|id|entityid|entity_id)$/i.test(k) && (typeof v==="string"||typeof v==="number")){
+      vals.push(`${k}=${v}`);
+    }
+    return false;
+  });
+  return [...new Set(vals)];
+}
+
+function collectCoordinateEvidence(obj){
+  const found=[];
+  const all=recursiveFind(obj,()=>true);
+  for(const x of all){
+    const k=x.key.toLowerCase();
+    const v=x.value;
+    if(typeof v==="number" || (typeof v==="string" && /^-?\d+(\.\d+)?$/.test(v))){
+      const n=Number(v);
+      if(["x","y","lon","lng","longitude","lat","latitude","centroidx","centroidy"].includes(k)){
+        found.push(`${x.path}=${n}`);
+      }
+    }
+    if(typeof v==="string"){
+      const p=parseWktPoint(v);
+      if(p) found.push(`${x.path}=POINT(${p.x} ${p.y})`);
+    }
+  }
+  return [...new Set(found)];
+}
+
+function flattenFields(item){
+  const out={};
+  if(!item || typeof item!=="object") return out;
+  if(Array.isArray(item.Fields)){
+    for(const f of item.Fields){
+      const name=f?.FieldName ?? f?.Name ?? f?.fieldName ?? f?.Key ?? "?";
+      const val=f?.Value ?? f?.FieldValue ?? f?.value ?? "";
+      out[String(name)]=val;
+    }
+  }
+  for(const [k,v] of Object.entries(item)){
+    if(k==="Fields") continue;
+    if(v===null || ["string","number","boolean"].includes(typeof v)) out[k]=v;
+  }
+  return out;
+}
+
+function responseCount(resp){
+  if(Array.isArray(resp?.data)) return resp.data.length;
+  if(Array.isArray(resp)) return resp.length;
+  const arrays=recursiveFind(resp,(k,v)=>Array.isArray(v));
+  let best=0;
+  for(const a of arrays) best=Math.max(best,a.value.length);
+  return best;
+}
+
+function extractEntitiesFromResponse(layer, method, alias, resp){
+  const rows=[];
+  const candidates=[];
+  if(Array.isArray(resp?.data)) resp.data.forEach((x,i)=>candidates.push({item:x,index:i}));
+  else if(Array.isArray(resp)) resp.forEach((x,i)=>candidates.push({item:x,index:i}));
+  else{
+    const arrays=recursiveFind(resp,(k,v)=>Array.isArray(v) && v.length>0 && v.every(x=>x && typeof x==="object"));
+    const seen=new Set();
+    for(const a of arrays){
+      a.value.forEach((x,i)=>{
+        const key=a.path+"#"+i;
+        if(!seen.has(key)){seen.add(key);candidates.push({item:x,index:i,path:a.path});}
+      });
+    }
+  }
+
+  for(const c of candidates.slice(0,250)){
+    const item=c.item;
+    const fields=flattenFields(item);
+    const wkts=collectWkts(item);
+    const coords=collectCoordinateEvidence(item);
+    const ids=collectIds(item);
+    const distance=item?.distance ?? item?.Distance ?? fields.distance ?? fields.Distance ?? null;
+    rows.push({
+      layerKey:layer.key,
+      layerLabel:layer.label,
+      method,alias,
+      index:c.index,
+      path:c.path||"$.data",
+      distance,
+      wkts,coords,ids,fields,
+      raw:item
+    });
+  }
+  return rows;
+}
+
+async function getLayerDataProbe(layer, alias, geo, radius){
+  const call=await safeSdkCall(
+    `${layer.label} getLayerData alias=${alias}`,
+    ()=>govmap.getLayerData({LayerName:alias,Point:{x:geo.x,y:geo.y},Radius:radius})
+  );
+  if(!call.ok) return {method:"getLayerData",alias,ok:false,error:call.error,ms:call.ms,entities:[]};
+  const resp=call.result;
+  return {
+    method:"getLayerData",alias,ok:true,ms:call.ms,
+    status:resp?.status,errorCode:resp?.errorCode,message:resp?.message,
+    count:responseCount(resp),
+    coords:collectCoordinateEvidence(resp),
+    wkts:collectWkts(resp),
+    ids:collectIds(resp),
+    entities:extractEntitiesFromResponse(layer,"getLayerData",alias,resp),
+    raw:resp
+  };
+}
+
+async function intersectProbe(layer, alias, geo, radius){
+  if(typeof govmap.intersectFeatures!=="function") return {method:"intersectFeatures",alias,ok:false,error:"Function unavailable",entities:[]};
+
+  const variants=[
+    {fields:["OBJECTID"],label:"OBJECTID"},
+    {fields:[],label:"empty-fields"}
+  ];
+
+  for(const v of variants){
+    const params={
+      geometry:`POINT(${geo.x} ${geo.y})`,
+      layerName:alias,
+      fields:v.fields,
+      radius:radius,
+      useCurrentFilter:false,
+      getShapes:true
+    };
+    const call=await safeSdkCall(
+      `${layer.label} intersectFeatures alias=${alias} fields=${v.label}`,
+      ()=>govmap.intersectFeatures(params)
+    );
+    if(call.ok){
+      const resp=call.result;
+      const count=responseCount(resp);
+      const wkts=collectWkts(resp);
+      const coords=collectCoordinateEvidence(resp);
+      const entities=extractEntitiesFromResponse(layer,"intersectFeatures",alias,resp);
+      if(count>0 || wkts.length>0 || coords.length>0){
+        return {method:"intersectFeatures",alias,ok:true,variant:v.label,ms:call.ms,count,wkts,coords,ids:collectIds(resp),entities,raw:resp};
+      }
+      if(v===variants[variants.length-1]){
+        return {method:"intersectFeatures",alias,ok:true,variant:v.label,ms:call.ms,count,wkts,coords,ids:collectIds(resp),entities,raw:resp};
+      }
+    } else if(v===variants[variants.length-1]){
+      return {method:"intersectFeatures",alias,ok:false,error:call.error,ms:call.ms,entities:[]};
+    }
+  }
+}
+
+async function selectFeaturesProbe(layer, alias, geo, radius){
+  if(typeof govmap.selectFeaturesOnMap!=="function") return {method:"selectFeaturesOnMap",alias,ok:false,error:"Function unavailable",entities:[]};
+
+  const variants=[
+    {
+      label:"no-returnFields",
+      params:{
+        continous:false,filterLayer:false,isZoomToExtent:false,
+        layers:[alias],selectOnMap:false,getWkt:true,
+        wkt:`POINT(${geo.x} ${geo.y})`,radius
+      }
+    },
+    {
+      label:"generic-fields",
+      params:{
+        continous:false,filterLayer:false,isZoomToExtent:false,
+        layers:[alias],selectOnMap:false,getWkt:true,
+        wkt:`POINT(${geo.x} ${geo.y})`,radius,
+        returnFields:{
+          [alias]:["OBJECTID","objectid","x","y","value0","value1","value2","value3","value4","value5","value6","value7","value8","value9"]
+        }
+      }
+    }
+  ];
+
+  for(const v of variants){
+    const call=await safeSdkCall(
+      `${layer.label} selectFeaturesOnMap alias=${alias} ${v.label}`,
+      ()=>govmap.selectFeaturesOnMap(v.params)
+    );
+    if(call.ok){
+      const resp=call.result;
+      const count=responseCount(resp);
+      const wkts=collectWkts(resp);
+      const coords=collectCoordinateEvidence(resp);
+      const entities=extractEntitiesFromResponse(layer,"selectFeaturesOnMap",alias,resp);
+      if(count>0 || wkts.length>0 || coords.length>0){
+        return {method:"selectFeaturesOnMap",alias,ok:true,variant:v.label,ms:call.ms,count,wkts,coords,ids:collectIds(resp),entities,raw:resp};
+      }
+      if(v===variants[variants.length-1]){
+        return {method:"selectFeaturesOnMap",alias,ok:true,variant:v.label,ms:call.ms,count,wkts,coords,ids:collectIds(resp),entities,raw:resp};
+      }
+    } else if(v===variants[variants.length-1]){
+      return {method:"selectFeaturesOnMap",alias,ok:false,error:call.error,ms:call.ms,entities:[]};
+    }
+  }
+}
+
+function itmPointsFromProbe(probe){
+  const pts=[];
+  for(const w of probe?.wkts||[]){
+    const p=parseWktPoint(w);
+    if(p && p.x>100000 && p.x<300000 && p.y>350000 && p.y<850000) pts.push(p);
+  }
+  for(const e of probe?.entities||[]){
+    for(const w of e.wkts||[]){
+      const p=parseWktPoint(w);
+      if(p && p.x>100000 && p.x<300000 && p.y>350000 && p.y<850000) pts.push(p);
+    }
+    const f=e.fields||{};
+    const xCandidates=[f.x,f.X,f.itm_x,f.ITM_X,f.x_itm];
+    const yCandidates=[f.y,f.Y,f.itm_y,f.ITM_Y,f.y_itm];
+    for(const xv of xCandidates) for(const yv of yCandidates){
+      const x=Number(xv), y=Number(yv);
+      if(Number.isFinite(x)&&Number.isFinite(y)&&x>100000&&x<300000&&y>350000&&y<850000) pts.push({x,y,raw:"fields"});
+    }
+  }
+  const uniq=[];
+  const seen=new Set();
+  for(const p of pts){
+    const k=`${p.x.toFixed(2)},${p.y.toFixed(2)}`;
+    if(!seen.has(k)){seen.add(k);uniq.push(p);}
+  }
+  return uniq;
+}
+
+async function identifyProbe(layer, alias, itmPoint){
+  if(typeof govmap.identifyByXYAndLayer!=="function") return {method:"identifyByXYAndLayer",alias,ok:false,error:"Function unavailable",entities:[]};
+  const call=await safeSdkCall(
+    `${layer.label} identifyByXYAndLayer alias=${alias}`,
+    ()=>govmap.identifyByXYAndLayer(itmPoint.x,itmPoint.y,[alias])
+  );
+  if(!call.ok) return {method:"identifyByXYAndLayer",alias,ok:false,error:call.error,ms:call.ms,entities:[]};
+  const resp=call.result;
+  return {
+    method:"identifyByXYAndLayer",alias,ok:true,ms:call.ms,count:responseCount(resp),
+    wkts:collectWkts(resp),coords:collectCoordinateEvidence(resp),ids:collectIds(resp),
+    entities:extractEntitiesFromResponse(layer,"identifyByXYAndLayer",alias,resp),raw:resp
+  };
+}
+
+async function testLayerAt(layer, address, radius){
+  log(`===== ${layer.label} at "${address}" radius=${radius} =====`);
+  const geo=await geocodeAddress(address);
+  if(!geo.ok){
+    return {layer,address,radius,geocode:geo,probes:[],workingAlias:null,notes:["Geocode failed"]};
+  }
+
+  try{
+    if(typeof govmap.zoomToXY==="function"){
+      govmap.zoomToXY({x:geo.x,y:geo.y,level:8,marker:true});
+    }
+  }catch{}
+
+  const probes=[];
+  let workingAlias=null;
+  let bestGet=null;
+
+  for(const alias of selectedAliases(layer)){
+    const p=await getLayerDataProbe(layer,alias,geo,radius);
+    probes.push(p);
+    if(p.ok && p.count>0){
+      workingAlias=alias;
+      bestGet=p;
+      break;
+    }
+    if(!bestGet && p.ok) bestGet=p;
+  }
+
+  const deepAliases=[];
+  if(workingAlias) deepAliases.push(workingAlias);
+  for(const a of selectedAliases(layer)) if(!deepAliases.includes(a)) deepAliases.push(a);
+
+  let bestIntersect=null;
+  if(document.getElementById("doIntersect").checked){
+    for(const alias of deepAliases){
+      const p=await intersectProbe(layer,alias,geo,radius);
+      probes.push(p);
+      if(p.ok && ((p.count||0)>0 || (p.wkts||[]).length || (p.coords||[]).length)){
+        bestIntersect=p;
+        if(!workingAlias) workingAlias=alias;
+        break;
+      }
+      if(!bestIntersect && p.ok) bestIntersect=p;
+    }
+  }
+
+  let bestSelect=null;
+  if(document.getElementById("doSelect").checked){
+    for(const alias of deepAliases){
+      const p=await selectFeaturesProbe(layer,alias,geo,radius);
+      probes.push(p);
+      if(p.ok && ((p.count||0)>0 || (p.wkts||[]).length || (p.coords||[]).length)){
+        bestSelect=p;
+        if(!workingAlias) workingAlias=alias;
+        break;
+      }
+      if(!bestSelect && p.ok) bestSelect=p;
+    }
+  }
+
+  if(document.getElementById("doIdentify").checked){
+    const source=[bestSelect,bestIntersect,bestGet].filter(Boolean);
+    let point=null;
+    for(const p of source){
+      const pts=itmPointsFromProbe(p);
+      if(pts.length){point=pts[0];break;}
+    }
+    if(point){
+      const alias=workingAlias||layer.aliases[0];
+      const p=await identifyProbe(layer,alias,point);
+      probes.push(p);
+    }
+  }
+
+  const allEntities=probes.flatMap(p=>p.entities||[]);
+  REPORT.entities.push(...allEntities);
+
+  const coords=[...new Set(probes.flatMap(p=>p.coords||[]))];
+  const wkts=[...new Set(probes.flatMap(p=>p.wkts||[]))];
+  const ids=[...new Set(probes.flatMap(p=>p.ids||[]))];
+  const fieldNames=[...new Set(allEntities.flatMap(e=>Object.keys(e.fields||{})))];
+
+  const notes=[];
+  const maxGet=Math.max(0,...probes.filter(p=>p.method==="getLayerData").map(p=>p.count||0));
+  if(maxGet===100) notes.push("getLayerData hit 100 result cap");
+  if(!coords.length && !wkts.length) notes.push("No direct geometry/coordinate evidence yet");
+  if(coords.length || wkts.length) notes.push("Geometry/coordinates discovered");
+  if(!workingAlias) notes.push("No alias returned positive data at this point");
+
+  const result={layer,address,radius,geocode:geo,workingAlias,probes,coords,wkts,ids,fieldNames,notes};
+  REPORT.tests.push(result);
+  return result;
+}
+
+function methodSummary(test,method){
+  const ps=test.probes.filter(p=>p.method===method);
+  if(!ps.length) return "not run";
+  const good=ps.filter(p=>p.ok);
+  const positive=good.find(p=>(p.count||0)>0 || (p.wkts||[]).length || (p.coords||[]).length);
+  if(positive) return `YES: ${positive.count||0} items, alias=${positive.alias}`;
+  if(good.length) return `OK but no data (${good.map(x=>x.alias).join(", ")})`;
+  return "FAILED";
+}
+
+function addSummary(test){
+  const tr=document.createElement("tr");
+  tr.style.cursor="pointer";
+  tr.onclick=()=>document.getElementById("raw").textContent=JSON.stringify(test,null,2);
+  tr.innerHTML=`
+    <td>${esc(test.layer.label)}</td>
+    <td class="mono">${esc(test.workingAlias||"")}</td>
+    <td>${esc(test.address)}</td>
+    <td>${esc(test.radius)}m</td>
+    <td>${esc(methodSummary(test,"getLayerData"))}</td>
+    <td>${esc(methodSummary(test,"intersectFeatures"))}</td>
+    <td>${esc(methodSummary(test,"selectFeaturesOnMap"))}</td>
+    <td>${test.coords.length} coord refs<br>${test.wkts.length} WKT/shapes</td>
+    <td>${test.ids.length}<div class="mono">${esc(test.ids.slice(0,6).join("\n"))}</div></td>
+    <td class="mono">${esc(test.fieldNames.slice(0,30).join(", "))}</td>
+    <td>${esc(test.notes.join("; "))}</td>`;
+  document.getElementById("summary").appendChild(tr);
+}
+
+function addEntity(e){
+  const tr=document.createElement("tr");
+  tr.style.cursor="pointer";
+  tr.onclick=()=>document.getElementById("raw").textContent=JSON.stringify(e,null,2);
+  tr.innerHTML=`
+    <td>${esc(e.layerLabel)}</td>
+    <td>${esc(e.method)}</td>
+    <td class="mono">${esc(e.alias)}</td>
+    <td>${esc(e.index)}</td>
+    <td>${esc(e.distance??"")}</td>
+    <td class="mono">${esc((e.coords||[]).slice(0,10).join("\n"))}</td>
+    <td class="mono">${esc((e.wkts||[]).slice(0,5).join("\n"))}</td>
+    <td class="mono">${esc((e.ids||[]).slice(0,10).join("\n"))}</td>
+    <td class="mono">${esc(Object.entries(e.fields||{}).slice(0,40).map(([k,v])=>`${k}=${v}`).join("\n"))}</td>`;
+  document.getElementById("entities").appendChild(tr);
+}
+
+function renderAll(){
+  document.getElementById("summary").innerHTML="";
+  document.getElementById("entities").innerHTML="";
+  REPORT.tests.forEach(addSummary);
+  REPORT.entities.slice(0,2000).forEach(addEntity);
+}
+
+async function runPlan(plan){
+  if(!document.getElementById("token").value.trim()){alert("הדבק token ואתחל קודם");return;}
+  REPORT.tests=[];
+  REPORT.entities=[];
+  document.getElementById("summary").innerHTML="";
+  document.getElementById("entities").innerHTML="";
+  document.getElementById("raw").textContent="";
+  document.getElementById("log").textContent="";
+  REPORT.startedAt=now();
+
+  const total=plan.length;
+  for(let i=0;i<plan.length;i++){
+    const p=plan[i];
+    document.getElementById("runStatus").textContent=`מריץ ${i+1}/${total}: ${p.layer.label}`;
+    document.getElementById("progressBar").style.width=`${Math.round(i/total*100)}%`;
+    const t=await testLayerAt(p.layer,p.address,p.radius);
+    addSummary(t);
+    t.probes.flatMap(x=>x.entities||[]).forEach(addEntity);
+  }
+  document.getElementById("progressBar").style.width="100%";
+  document.getElementById("runStatus").innerHTML='<span class="ok">DONE</span>';
+}
+
+async function runPointDeepTest(){
+  const address=document.getElementById("address").value.trim();
+  const radius=Math.min(3000,Math.max(10,Number(document.getElementById("radius").value)||250));
+  const layers=selectedLayers();
+  if(!address||!layers.length){alert("בחר שכבות וכתוב כתובת");return;}
+  const plan=layers.map(layer=>({layer,address,radius}));
+  await runPlan(plan);
+}
+
+async function runRecommendedDiscovery(){
+  const layers=selectedLayers();
+  const plan=layers.map(layer=>({
+    layer,
+    address:layer.recommendedAddress,
+    radius:layer.recommendedRadius
+  }));
+  await runPlan(plan);
+}
+
+async function visualizeLayer(key){
+  const layer=LAYERS.find(x=>x.key===key);
+  if(!layer) return;
+  const address=layer.recommendedAddress;
+  const geo=await geocodeAddress(address);
+  if(!geo.ok){alert("Geocode failed");return;}
+
+  for(const alias of layer.aliases){
+    try{
+      if(typeof govmap.setVisibleLayers==="function"){
+        await Promise.resolve(govmap.setVisibleLayers([alias]));
+      }
+      if(typeof govmap.zoomToXY==="function"){
+        govmap.zoomToXY({x:geo.x,y:geo.y,level:7,marker:true});
+      }
+      log(`visualizeLayer ${layer.label}: tried ${alias}`);
+      break;
+    }catch(e){
+      log(`visualizeLayer ${layer.label} alias ${alias} failed: ${e}`);
+    }
+  }
+}
+
+function downloadJson(){
+  const blob=new Blob([JSON.stringify(REPORT,null,2)],{type:"application/json;charset=utf-8"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download="govmap-deep-layer-report.json";
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+
+function csvCell(v){
+  const s=String(v??"").replace(/"/g,'""');
+  return `"${s}"`;
+}
+function downloadCsv(){
+  const headers=["layer","method","alias","index","distance","coords","wkts","ids","fields_json"];
+  const lines=[headers.join(",")];
+  for(const e of REPORT.entities){
+    lines.push([
+      e.layerLabel,e.method,e.alias,e.index,e.distance,
+      (e.coords||[]).join(" | "),
+      (e.wkts||[]).join(" | "),
+      (e.ids||[]).join(" | "),
+      JSON.stringify(e.fields||{})
+    ].map(csvCell).join(","));
+  }
+  const blob=new Blob(["\ufeff"+lines.join("\n")],{type:"text/csv;charset=utf-8"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download="govmap-extracted-entities.csv";
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+</script>
+</body>
+</html>
