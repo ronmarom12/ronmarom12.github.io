@@ -1,0 +1,1019 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LocSight GovMap Bridge</title>
+
+<!--
+LocSight GovMap Bridge
+
+Purpose:
+- Run GovMap calls client-side from the approved hostname.
+- Expose a small JS bridge that LocSight Android/WebView or a parent web app can call.
+- Return normalized JSON that LocSight can forward to its own server.
+- Avoid direct server-side GovMap calls.
+
+Important:
+- Do not spoof Origin/Referer.
+- GovMap approval is currently hostname-bound and client-side only.
+- This page does not make GovMap server-side.
+- If a source requires attribution or special license text, preserve it.
+-->
+
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/proj4@2.11.0/dist/proj4.js"></script>
+<script src="https://www.govmap.gov.il/govmap/api/govmap.api.js"></script>
+
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;font-family:Arial,sans-serif}
+  #govmap-hidden-map{
+    position:fixed;
+    left:-10000px;
+    top:-10000px;
+    width:320px;
+    height:240px;
+    opacity:0.01;
+    pointer-events:none;
+  }
+  #debug{
+    display:none;
+    padding:16px;
+    direction:rtl;
+    background:#fafafa;
+    min-height:100vh;
+    box-sizing:border-box;
+  }
+  #debug pre{direction:ltr;text-align:left;white-space:pre-wrap;background:#111;color:#eee;padding:12px;max-height:60vh;overflow:auto}
+  #debug input,#debug select,#debug button{font:inherit;padding:7px;margin:4px}
+</style>
+</head>
+
+<body>
+<div id="govmap-hidden-map"></div>
+
+<div id="debug">
+  <h2>LocSight GovMap Bridge Debug</h2>
+  <div>Origin: <code id="dbg-origin"></code></div>
+  <p>
+    <input id="dbg-token" type="password" size="70" placeholder="GovMap token">
+    <button id="dbg-init">Initialize</button>
+  </p>
+  <p>
+    <select id="dbg-layer">
+      <option value="shelters">shelters</option>
+      <option value="bus_stops">bus_stops</option>
+      <option value="defibrillators">defibrillators</option>
+      <option value="gas_stations">gas_stations</option>
+      <option value="restaurants">restaurants</option>
+      <option value="orange_bins">orange_bins</option>
+    </select>
+    <input id="dbg-lat" value="32.0790" placeholder="lat">
+    <input id="dbg-lon" value="34.7740" placeholder="lon">
+    <input id="dbg-radius" value="250" placeholder="radius">
+    <button id="dbg-nearby">Nearby</button>
+  </p>
+  <pre id="dbg-out"></pre>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const VERSION = "1.0.0";
+
+  /*
+   * Production configuration.
+   *
+   * GOVMAP_TOKEN can stay blank and be injected at runtime by the Android app:
+   *   await LocSightGovMap.configure({ token: "..." })
+   *
+   * If Claude Code prefers the smallest integration, it can place the token here.
+   * This is a client-side token and should never be treated as a server secret.
+   */
+  const CONFIG = {
+    GOVMAP_TOKEN: "",
+
+    // Keep requests serialized. The earlier tests triggered throttling when many
+    // GovMap calls were sent rapidly.
+    MIN_REQUEST_INTERVAL_MS: 1800,
+
+    // Retry delays used only when an error looks like throttling.
+    RETRY_DELAYS_MS: [5000, 10000, 20000],
+
+    // GovMap spatial APIs observed a 3000 meter maximum in testing.
+    MAX_RADIUS_METERS: 3000,
+
+    // Short in-memory cache to avoid repeated calls while the map/user barely moved.
+    CACHE_TTL_MS: 20000,
+
+    /*
+     * For browser iframe usage, explicitly add the LocSight web origins.
+     * Example:
+     * ALLOWED_PARENT_ORIGINS: ["https://app.locsight.example"]
+     *
+     * Android WebView can call window.LocSightGovMap directly and does not need this.
+     */
+    ALLOWED_PARENT_ORIGINS: []
+  };
+
+  /*
+   * Layer names, IDs and field names are based on the GovMap responses already
+   * observed in testing.
+   *
+   * apiName is the value sent to GovMap spatial functions.
+   * layerId is informational and useful for diagnostics.
+   */
+  const LAYERS = {
+    bus_stops: {
+      key: "bus_stops",
+      apiName: "bus_stops",
+      layerId: "20",
+      caption: "תחנות אוטובוס",
+      fields: [
+        "x","y","zone_id","stop_code","stop_desc",
+        "stop_name","location_type","parent_station"
+      ],
+      display: {
+        x:"X", y:"Y", zone_id:"zone_id", stop_code:"STOP_CODE",
+        stop_desc:"STOP_DESC", stop_name:"STOP_NAME",
+        location_type:"location_type", parent_station:"parent_station"
+      },
+      directWgs84: { lonField:"x", latField:"y" },
+      attribution: null
+    },
+
+    shelters: {
+      key: "shelters",
+      apiName: "BOMBSHELTERS",
+      layerId: "226453",
+      caption: "מקלטים",
+      fields: ["type_of_shelter_text"],
+      display: {
+        type_of_shelter_text:"סוג מקלט"
+      },
+      directWgs84: null,
+      attribution: "GovMap / מפ\"י"
+    },
+
+    defibrillators: {
+      key: "defibrillators",
+      apiName: "224727",
+      layerId: "224727",
+      caption: "מיקומי דפיברילטורים",
+      fields: [
+        "id","origin","img_url","contact_na","contact_ph","index_city",
+        "location_1","location_c","location_d","location_f",
+        "location_h","location_n","location_s"
+      ],
+      display: {
+        id:"מזהה",
+        origin:"מקור המידע",
+        img_url:"קישור לתמונה",
+        contact_na:"איש קשר",
+        contact_ph:"פרטי קשר",
+        index_city:"עיר",
+        location_1:"מספר אתר",
+        location_c:"מיקום",
+        location_d:"תיאור מקום",
+        location_f:"קומה",
+        location_h:"שעות זמינות",
+        location_n:"שם אתר",
+        location_s:"רחוב"
+      },
+      directWgs84: null,
+      attribution:
+        "מקור המידע מפלטפורמת ״איפה דפי?״. אין להסיר כתב זה מכל עותק חלקי או מלא של המידע. השימוש בהתאם לרישיון: https://defi.co.il/openuse"
+    },
+
+    gas_stations: {
+      key: "gas_stations",
+      apiName: "GASSTATIONS",
+      layerId: "228305",
+      caption: "תחנות דלק",
+      fields: ["value1","value2","value3","value4","value5"],
+      display: {
+        value1:"חברה",
+        value2:"כתובת",
+        value3:"שם",
+        value4:"עיר",
+        value5:"אזור"
+      },
+      directWgs84: null,
+      attribution: null
+    },
+
+    restaurants: {
+      key: "restaurants",
+      apiName: "restaurants",
+      layerId: "388",
+      caption: "מסעדות",
+      fields: [
+        "fax","url","city","name","email","phone","region","address",
+        "near_to","parking","chefs_name","restaurant_","accessibility",
+        "opening_hours","chef_restaurant","type_of_kashrut",
+        "business_license","shortdescription","notes_for_opening_hours",
+        "opening_hours_on_friday","opening_hours_on_saturday"
+      ],
+      display: {
+        fax:"פקס",
+        url:"קישור",
+        city:"עיר",
+        name:"שם",
+        email:"דוא\"ל",
+        phone:"טלפון",
+        region:"אזור",
+        address:"כתובת",
+        near_to:"ליד",
+        parking:"חניה",
+        chefs_name:"שם השף",
+        restaurant_:"סוג מסעדה",
+        accessibility:"נגישות לנכים",
+        opening_hours:"שעות פתיחה",
+        chef_restaurant:"מסעדת שף",
+        type_of_kashrut:"סוג כשרות",
+        business_license:"רשיון עסק",
+        shortdescription:"תאור",
+        notes_for_opening_hours:"הערות לשעות פתיחה",
+        opening_hours_on_friday:"שעות פתיחה בשישי",
+        opening_hours_on_saturday:"שעות פתיחה בשבת"
+      },
+      directWgs84: null,
+      attribution: null
+    },
+
+    orange_bins: {
+      key: "orange_bins",
+      apiName: "200718",
+      layerId: "200718",
+      caption: "פח כתום במרחב ציבורי",
+      fields: ["type_","adress","barcode","x_coord","y_coord","city_name"],
+      display: {
+        type_:"סוג",
+        adress:"כתובת",
+        barcode:"ברקוד",
+        x_coord:"X מיקום גיאוגרפי",
+        y_coord:"Y מיקום גיאוגרפי",
+        city_name:"שם רשות"
+      },
+
+      /*
+       * Observed GovMap values:
+       * x_coord looked like latitude around 32.x
+       * y_coord looked like longitude around 34.x
+       */
+      directWgs84: { latField:"x_coord", lonField:"y_coord" },
+      attribution: null
+    }
+  };
+
+  /*
+   * EPSG:2039 Israel 1993 / Israeli TM Grid.
+   * Definition from EPSG registry representation.
+   */
+  proj4.defs(
+    "EPSG:2039",
+    "+proj=tmerc +lat_0=31.7343936111111 +lon_0=35.2045169444444 " +
+    "+k=1.0000067 +x_0=219529.584 +y_0=626907.39 +ellps=GRS80 " +
+    "+towgs84=23.772,17.49,17.859,-0.3132,-1.85274,1.67299,-5.4262 " +
+    "+units=m +no_defs +type=crs"
+  );
+
+  const STATE = {
+    initialized: false,
+    initPromise: null,
+    token: CONFIG.GOVMAP_TOKEN,
+    lastRequestAt: 0,
+    queue: Promise.resolve(),
+    cache: new Map()
+  };
+
+  function nowIso() {
+    return new Date().toISOString();
+  }
+
+  function errorObject(err) {
+    if (!err) return { message:"Unknown error" };
+    return {
+      message: String(err.message || err),
+      name: err.name || null,
+      stack: err.stack || null
+    };
+  }
+
+  function looksLikeThrottle(err) {
+    const s = String(err && (err.message || err)).toLowerCase();
+    return (
+      s.includes("429") ||
+      s.includes("too many") ||
+      s.includes("rate limit") ||
+      s.includes("throttle") ||
+      s.includes("יותר מדי") ||
+      s.includes("המתן") ||
+      s.includes("עומס")
+    );
+  }
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  async function pace() {
+    const wait = Math.max(
+      0,
+      STATE.lastRequestAt + CONFIG.MIN_REQUEST_INTERVAL_MS - Date.now()
+    );
+    if (wait > 0) await sleep(wait);
+    STATE.lastRequestAt = Date.now();
+  }
+
+  async function runGovMapCall(label, fn) {
+    let attempt = 0;
+
+    while (true) {
+      await pace();
+
+      try {
+        const started = performance.now();
+        const result = await Promise.race([
+          Promise.resolve().then(fn),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("GovMap timeout: " + label)), 30000)
+          )
+        ]);
+
+        return {
+          ok: true,
+          label,
+          ms: Math.round(performance.now() - started),
+          result
+        };
+      } catch (err) {
+        if (
+          looksLikeThrottle(err) &&
+          attempt < CONFIG.RETRY_DELAYS_MS.length
+        ) {
+          const delay = CONFIG.RETRY_DELAYS_MS[attempt++];
+          await sleep(delay);
+          continue;
+        }
+
+        return {
+          ok: false,
+          label,
+          error: errorObject(err)
+        };
+      }
+    }
+  }
+
+  function enqueue(task) {
+    const next = STATE.queue.then(task, task);
+    STATE.queue = next.catch(() => {});
+    return next;
+  }
+
+  function cacheGet(key) {
+    const item = STATE.cache.get(key);
+    if (!item) return null;
+
+    if (Date.now() - item.at > CONFIG.CACHE_TTL_MS) {
+      STATE.cache.delete(key);
+      return null;
+    }
+
+    return item.value;
+  }
+
+  function cachePut(key, value) {
+    STATE.cache.set(key, { at: Date.now(), value });
+  }
+
+  function wgs84ToItm(lat, lon) {
+    const xy = proj4("EPSG:4326", "EPSG:2039", [Number(lon), Number(lat)]);
+    return { x: xy[0], y: xy[1] };
+  }
+
+  function itmToWgs84(x, y) {
+    const ll = proj4("EPSG:2039", "EPSG:4326", [Number(x), Number(y)]);
+    return { lon: ll[0], lat: ll[1] };
+  }
+
+  function normalizeRadius(radiusMeters) {
+    const r = Number(radiusMeters);
+    if (!Number.isFinite(r) || r <= 0) {
+      throw new Error("radiusMeters must be a positive number");
+    }
+    return Math.min(r, CONFIG.MAX_RADIUS_METERS);
+  }
+
+  function parseFirstPointFromWkt(wkt) {
+    if (typeof wkt !== "string") return null;
+
+    const match = wkt.match(
+      /(?:MULTIPOINT|POINT)\s*\(?\s*\(?\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)/i
+    );
+
+    if (!match) return null;
+
+    return {
+      x: Number(match[1]),
+      y: Number(match[2])
+    };
+  }
+
+  function findGeometryWkt(values) {
+    if (!Array.isArray(values)) return null;
+
+    for (let i = values.length - 1; i >= 0; i--) {
+      const v = values[i];
+      if (
+        typeof v === "string" &&
+        /^\s*(POINT|MULTIPOINT|LINESTRING|MULTILINESTRING|POLYGON|MULTIPOLYGON)\s*\(/i.test(v)
+      ) {
+        return v;
+      }
+    }
+
+    return null;
+  }
+
+  function haversineMeters(lat1, lon1, lat2, lon2) {
+    const R = 6371008.8;
+    const toRad = d => d * Math.PI / 180;
+    const p1 = toRad(lat1);
+    const p2 = toRad(lat2);
+    const dp = toRad(lat2 - lat1);
+    const dl = toRad(lon2 - lon1);
+
+    const a =
+      Math.sin(dp / 2) ** 2 +
+      Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
+
+    return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
+  function displayProperties(layer, rawProperties) {
+    const out = {};
+
+    for (const [internalName, value] of Object.entries(rawProperties || {})) {
+      out[layer.display[internalName] || internalName] = value;
+    }
+
+    return out;
+  }
+
+  function directWgs84FromFields(layer, fields) {
+    const hint = layer.directWgs84;
+    if (!hint) return null;
+
+    const lat = Number(fields[hint.latField]);
+    const lon = Number(fields[hint.lonField]);
+
+    if (
+      Number.isFinite(lat) &&
+      Number.isFinite(lon) &&
+      lat >= 29 && lat <= 34 &&
+      lon >= 34 && lon <= 36
+    ) {
+      return { lat, lon };
+    }
+
+    return null;
+  }
+
+  function normalizeIntersectResponse(layer, query, response) {
+    const data = Array.isArray(response && response.data) ? response.data : [];
+    const results = [];
+
+    for (const item of data) {
+      const values = Array.isArray(item.Values) ? item.Values : [];
+      const fields = {};
+
+      for (let i = 0; i < layer.fields.length; i++) {
+        fields[layer.fields[i]] = values[i] ?? null;
+      }
+
+      const geometryWkt = findGeometryWkt(values);
+      const itmPoint = parseFirstPointFromWkt(geometryWkt);
+
+      let wgs84 = directWgs84FromFields(layer, fields);
+
+      if (!wgs84 && itmPoint) {
+        wgs84 = itmToWgs84(itmPoint.x, itmPoint.y);
+      }
+
+      let distanceMeters = null;
+
+      if (itmPoint) {
+        distanceMeters = Math.hypot(
+          itmPoint.x - query.itm.x,
+          itmPoint.y - query.itm.y
+        );
+      } else if (wgs84 && query.wgs84) {
+        distanceMeters = haversineMeters(
+          query.wgs84.lat,
+          query.wgs84.lon,
+          wgs84.lat,
+          wgs84.lon
+        );
+      }
+
+      results.push({
+        objectId: item.ObjectId ?? item.objectId ?? null,
+        geometryWkt,
+        itm: itmPoint,
+        wgs84,
+        distanceMeters:
+          distanceMeters == null ? null : Math.round(distanceMeters * 100) / 100,
+        properties: fields,
+        displayProperties: displayProperties(layer, fields)
+      });
+    }
+
+    results.sort((a, b) => {
+      const da = a.distanceMeters == null ? Number.POSITIVE_INFINITY : a.distanceMeters;
+      const db = b.distanceMeters == null ? Number.POSITIVE_INFINITY : b.distanceMeters;
+      return da - db;
+    });
+
+    return {
+      layer: {
+        key: layer.key,
+        apiName: layer.apiName,
+        layerId: layer.layerId,
+        caption: layer.caption,
+        attribution: layer.attribution
+      },
+      query,
+      count: results.length,
+      results
+    };
+  }
+
+  async function initGovMap(tokenOverride) {
+    if (tokenOverride) STATE.token = tokenOverride;
+
+    if (STATE.initialized) {
+      return {
+        ok: true,
+        initialized: true,
+        origin: window.location.origin,
+        version: VERSION
+      };
+    }
+
+    if (STATE.initPromise) return STATE.initPromise;
+
+    if (!STATE.token) {
+      throw new Error(
+        "GovMap token is missing. Call LocSightGovMap.configure({token}) first."
+      );
+    }
+
+    STATE.initPromise = (async () => {
+      await govmap.createMap("govmap-hidden-map", {
+        token: STATE.token,
+        showXY: false,
+        identifyOnClick: false,
+        isEmbeddedToggle: false
+      });
+
+      STATE.initialized = true;
+
+      return {
+        ok: true,
+        initialized: true,
+        origin: window.location.origin,
+        version: VERSION
+      };
+    })();
+
+    try {
+      return await STATE.initPromise;
+    } catch (err) {
+      STATE.initPromise = null;
+      STATE.initialized = false;
+      throw err;
+    }
+  }
+
+  async function configure(options) {
+    options = options || {};
+
+    if (options.token) STATE.token = String(options.token);
+
+    if (Number.isFinite(Number(options.minRequestIntervalMs))) {
+      CONFIG.MIN_REQUEST_INTERVAL_MS = Math.max(
+        500,
+        Number(options.minRequestIntervalMs)
+      );
+    }
+
+    return initGovMap();
+  }
+
+  async function geocode(address) {
+    await initGovMap();
+
+    const key = "geocode:" + String(address).trim().toLowerCase();
+    const cached = cacheGet(key);
+    if (cached) return { ...cached, cacheHit: true };
+
+    const call = await enqueue(() =>
+      runGovMapCall(
+        "geocode",
+        () => govmap.geocode(
+          { keyword: String(address) },
+          govmap.geocodeType.FullResult
+        )
+      )
+    );
+
+    if (!call.ok) {
+      throw new Error(call.error.message);
+    }
+
+    const candidates = (call.result && call.result.data) || [];
+
+    const result = {
+      ok: true,
+      action: "geocode",
+      address: String(address),
+      count: candidates.length,
+      candidates: candidates.map(x => ({
+        label: x.ResultLable,
+        objectId: x.ObjectID,
+        type: x.DescLayerID,
+        itm: {
+          x: Number(x.X),
+          y: Number(x.Y)
+        },
+        wgs84: itmToWgs84(Number(x.X), Number(x.Y))
+      })),
+      timingMs: call.ms,
+      cacheHit: false
+    };
+
+    cachePut(key, result);
+    return result;
+  }
+
+  async function intersectNearby(layerKey, input) {
+    await initGovMap();
+
+    const layer = LAYERS[layerKey];
+    if (!layer) {
+      throw new Error(
+        "Unknown layer. Supported: " + Object.keys(LAYERS).join(", ")
+      );
+    }
+
+    const radiusMeters = normalizeRadius(input.radiusMeters || 250);
+
+    let itm;
+    let wgs84 = null;
+
+    if (
+      Number.isFinite(Number(input.x)) &&
+      Number.isFinite(Number(input.y))
+    ) {
+      itm = { x: Number(input.x), y: Number(input.y) };
+      wgs84 = itmToWgs84(itm.x, itm.y);
+    } else if (
+      Number.isFinite(Number(input.lat)) &&
+      Number.isFinite(Number(input.lon))
+    ) {
+      wgs84 = { lat: Number(input.lat), lon: Number(input.lon) };
+      itm = wgs84ToItm(wgs84.lat, wgs84.lon);
+    } else {
+      throw new Error("nearby requires either x/y (EPSG:2039) or lat/lon (WGS84)");
+    }
+
+    const query = {
+      wgs84,
+      itm,
+      radiusMeters
+    };
+
+    const cacheKey = [
+      "nearby",
+      layerKey,
+      itm.x.toFixed(1),
+      itm.y.toFixed(1),
+      radiusMeters
+    ].join(":");
+
+    const cached = cacheGet(cacheKey);
+    if (cached) return { ...cached, cacheHit: true };
+
+    /*
+     * Primary production path:
+     * one intersectFeatures call requesting both metadata fields and shapes.
+     */
+    const fullCall = await enqueue(() =>
+      runGovMapCall(
+        "intersectFeatures:" + layerKey,
+        () => govmap.intersectFeatures({
+          geometry: `POINT(${itm.x} ${itm.y})`,
+          layerName: layer.apiName,
+          fields: layer.fields,
+          radius: radiusMeters,
+          useCurrentFilter: false,
+          getShapes: true
+        })
+      )
+    );
+
+    let call = fullCall;
+    let metadataFallbackUsed = false;
+
+    /*
+     * Defensive fallback:
+     * If a future GovMap schema change makes one metadata field invalid,
+     * retry geometry-only. Claude Code can later update the layer field list.
+     */
+    if (!fullCall.ok) {
+      metadataFallbackUsed = true;
+
+      call = await enqueue(() =>
+        runGovMapCall(
+          "intersectFeaturesGeometryOnly:" + layerKey,
+          () => govmap.intersectFeatures({
+            geometry: `POINT(${itm.x} ${itm.y})`,
+            layerName: layer.apiName,
+            fields: [],
+            radius: radiusMeters,
+            useCurrentFilter: false,
+            getShapes: true
+          })
+        )
+      );
+    }
+
+    if (!call.ok) {
+      throw new Error(call.error.message);
+    }
+
+    const normalized = normalizeIntersectResponse(
+      metadataFallbackUsed ? { ...layer, fields: [] } : layer,
+      query,
+      call.result
+    );
+
+    const result = {
+      ok: true,
+      action: "nearby",
+      strategy: "intersectFeatures",
+      metadataFallbackUsed,
+      timingMs: call.ms,
+      cacheHit: false,
+      ...normalized
+    };
+
+    cachePut(cacheKey, result);
+    return result;
+  }
+
+  async function nearbyMany(input) {
+    const layers = Array.isArray(input.layers)
+      ? input.layers
+      : Object.keys(LAYERS);
+
+    const output = [];
+
+    for (const layerKey of layers) {
+      try {
+        const one = await intersectNearby(layerKey, input);
+        output.push({
+          layer: layerKey,
+          ok: true,
+          data: one
+        });
+      } catch (err) {
+        output.push({
+          layer: layerKey,
+          ok: false,
+          error: errorObject(err)
+        });
+      }
+    }
+
+    return {
+      ok: output.some(x => x.ok),
+      action: "nearbyMany",
+      generatedAt: nowIso(),
+      results: output
+    };
+  }
+
+  async function health() {
+    await initGovMap();
+
+    return {
+      ok: true,
+      action: "health",
+      version: VERSION,
+      origin: window.location.origin,
+      initialized: STATE.initialized,
+      supportedLayers: Object.values(LAYERS).map(x => ({
+        key: x.key,
+        apiName: x.apiName,
+        layerId: x.layerId,
+        caption: x.caption,
+        attribution: x.attribution
+      })),
+      functions: {
+        geocode: typeof govmap.geocode === "function",
+        intersectFeatures: typeof govmap.intersectFeatures === "function",
+        getLayerData: typeof govmap.getLayerData === "function",
+        identifyByXYAndLayer: typeof govmap.identifyByXYAndLayer === "function"
+      }
+    };
+  }
+
+  async function request(requestObject) {
+    const req = requestObject || {};
+    const action = req.action;
+
+    switch (action) {
+      case "health":
+        return health();
+
+      case "geocode":
+        return geocode(req.address);
+
+      case "nearby":
+        return intersectNearby(req.layer, req);
+
+      case "nearbyMany":
+        return nearbyMany(req);
+
+      case "convertWgs84ToItm":
+        return {
+          ok: true,
+          action,
+          input: { lat:Number(req.lat), lon:Number(req.lon) },
+          itm: wgs84ToItm(req.lat, req.lon)
+        };
+
+      case "convertItmToWgs84":
+        return {
+          ok: true,
+          action,
+          input: { x:Number(req.x), y:Number(req.y) },
+          wgs84: itmToWgs84(req.x, req.y)
+        };
+
+      default:
+        throw new Error(
+          "Unsupported action: " + action +
+          ". Supported: health, geocode, nearby, nearbyMany, " +
+          "convertWgs84ToItm, convertItmToWgs84"
+        );
+    }
+  }
+
+  async function requestJson(jsonOrObject) {
+    try {
+      const req =
+        typeof jsonOrObject === "string"
+          ? JSON.parse(jsonOrObject)
+          : jsonOrObject;
+
+      const result = await request(req);
+
+      return JSON.stringify({
+        requestId: req && req.requestId ? req.requestId : null,
+        ok: true,
+        data: result
+      });
+    } catch (err) {
+      return JSON.stringify({
+        ok: false,
+        error: errorObject(err)
+      });
+    }
+  }
+
+  /*
+   * Public API for Android WebView / evaluateJavascript.
+   *
+   * Example:
+   * await LocSightGovMap.configure({token:"..."});
+   *
+   * const json = await LocSightGovMap.requestJson({
+   *   action:"nearby",
+   *   layer:"shelters",
+   *   lat:32.079,
+   *   lon:34.774,
+   *   radiusMeters:250
+   * });
+   */
+  window.LocSightGovMap = {
+    version: VERSION,
+    configure,
+    request,
+    requestJson,
+    layers: () => JSON.parse(JSON.stringify(LAYERS))
+  };
+
+  /*
+   * Optional browser parent / iframe transport.
+   * Disabled unless the parent origin is explicitly whitelisted above.
+   */
+  window.addEventListener("message", async event => {
+    if (!CONFIG.ALLOWED_PARENT_ORIGINS.includes(event.origin)) return;
+
+    const msg = event.data;
+
+    if (!msg || msg.channel !== "locsight-govmap") return;
+
+    const response = await requestJson(msg.request || {});
+
+    if (event.source && typeof event.source.postMessage === "function") {
+      event.source.postMessage(
+        {
+          channel: "locsight-govmap-result",
+          requestId: msg.requestId || null,
+          response: JSON.parse(response)
+        },
+        event.origin
+      );
+    }
+  });
+
+  /*
+   * Optional automatic delivery to common Android wrappers.
+   * Claude Code may keep this or remove it depending on LocSight's WebView stack.
+   */
+  async function requestAndNotifyNative(req) {
+    const response = await requestJson(req);
+
+    try {
+      if (
+        window.LocSightAndroid &&
+        typeof window.LocSightAndroid.onGovMapResult === "function"
+      ) {
+        window.LocSightAndroid.onGovMapResult(response);
+      }
+    } catch (_) {}
+
+    try {
+      if (
+        window.ReactNativeWebView &&
+        typeof window.ReactNativeWebView.postMessage === "function"
+      ) {
+        window.ReactNativeWebView.postMessage(response);
+      }
+    } catch (_) {}
+
+    return response;
+  }
+
+  window.LocSightGovMap.requestAndNotifyNative = requestAndNotifyNative;
+
+  /*
+   * Debug UI.
+   * Add ?debug=1 to the URL. Production users see no UI.
+   */
+  const qs = new URLSearchParams(location.search);
+
+  if (qs.get("debug") === "1") {
+    document.getElementById("debug").style.display = "block";
+    document.getElementById("dbg-origin").textContent = location.origin;
+
+    document.getElementById("dbg-init").onclick = async () => {
+      const out = document.getElementById("dbg-out");
+
+      try {
+        const result = await configure({
+          token: document.getElementById("dbg-token").value.trim()
+        });
+        out.textContent = JSON.stringify(result, null, 2);
+      } catch (err) {
+        out.textContent = JSON.stringify(errorObject(err), null, 2);
+      }
+    };
+
+    document.getElementById("dbg-nearby").onclick = async () => {
+      const out = document.getElementById("dbg-out");
+
+      const req = {
+        action: "nearby",
+        layer: document.getElementById("dbg-layer").value,
+        lat: Number(document.getElementById("dbg-lat").value),
+        lon: Number(document.getElementById("dbg-lon").value),
+        radiusMeters: Number(document.getElementById("dbg-radius").value)
+      };
+
+      out.textContent = "Running...";
+
+      const response = await requestJson(req);
+      out.textContent = JSON.stringify(JSON.parse(response), null, 2);
+    };
+  }
+})();
+</script>
+</body>
+</html>
