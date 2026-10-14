@@ -2,56 +2,95 @@
 <html lang="he">
 <head>
     <meta charset="UTF-8">
-    <title>GovMap API Test</title>
+    <title>GovMap Real API Test</title>
 
     <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
     <script src="https://www.govmap.gov.il/govmap/api/govmap.api.js"></script>
 
     <style>
-        html, body {
-            margin: 0;
-            height: 100%;
-        }
-
-        #status {
-            height: 50px;
-            padding: 12px;
-            box-sizing: border-box;
+        body {
             font-family: Arial;
+            margin: 12px;
         }
 
         #map {
-            height: calc(100% - 50px);
+            height: 500px;
+            margin-top: 15px;
+        }
+
+        #output {
+            white-space: pre-wrap;
+            background: #eee;
+            padding: 12px;
+            margin-top: 15px;
         }
     </style>
 </head>
 
 <body>
 
-<div id="status">Starting GovMap test...</div>
+<h2>GovMap REAL API Test</h2>
+
+<div id="origin"></div>
+<div id="status">Starting...</div>
+
+<pre id="output"></pre>
+
 <div id="map"></div>
 
 <script>
-$(document).ready(function () {
+const TOKEN = "PUT_YOUR_REAL_TOKEN_HERE";
 
-    const TOKEN = "PUT_YOUR_GOVMAP_TOKEN_HERE";
+document.getElementById("origin").innerText =
+    "Origin: " + window.location.origin;
 
-    govmap.createMap('map', {
-        token: TOKEN,
-        showXY: true,
-        identifyOnClick: true,
-        isEmbeddedToggle: false
-    })
-    .then(function () {
+govmap.createMap("map", {
+    token: TOKEN,
+    showXY: true,
+    identifyOnClick: true
+})
+.then(async function () {
+
+    document.getElementById("status").innerText =
+        "Map loaded. Testing GEOCODE...";
+
+    try {
+
+        const response = await govmap.geocode(
+            {
+                keyword: "דיזנגוף 100, תל אביב"
+            },
+            govmap.geocodeType.FullResult
+        );
+
         document.getElementById("status").innerText =
-            "SUCCESS - GovMap API token accepted.";
-    })
-    .catch(function (err) {
-        document.getElementById("status").innerText =
-            "FAILED - " + JSON.stringify(err);
+            "GEOCODE SUCCESS";
 
-        console.error(err);
-    });
+        document.getElementById("output").innerText =
+            JSON.stringify(response, null, 2);
+
+        console.log("GEOCODE RESPONSE:", response);
+
+    }
+    catch (err) {
+
+        document.getElementById("status").innerText =
+            "GEOCODE FAILED";
+
+        document.getElementById("output").innerText =
+            String(err);
+
+        console.error("GEOCODE ERROR:", err);
+    }
+
+})
+.catch(function (err) {
+
+    document.getElementById("status").innerText =
+        "MAP CREATE FAILED";
+
+    document.getElementById("output").innerText =
+        String(err);
 
 });
 </script>
