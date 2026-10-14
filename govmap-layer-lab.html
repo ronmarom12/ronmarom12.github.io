@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GovMap Layer Lab</title>
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://www.govmap.gov.il/govmap/api/govmap.api.js"></script>
+<style>
+  body { font-family: Arial, sans-serif; margin: 18px; background:#fafafa; color:#111; }
+  h1,h2 { margin: 0 0 12px; }
+  .card { background:white; border:1px solid #ddd; border-radius:10px; padding:14px; margin-bottom:14px; }
+  input, button, textarea { font: inherit; }
+  input[type=text], input[type=password] { width:min(760px, 95%); padding:9px; margin:4px 0; }
+  button { padding:8px 14px; margin:4px; cursor:pointer; }
+  table { border-collapse:collapse; width:100%; background:white; font-size:13px; }
+  th, td { border:1px solid #ddd; padding:7px; vertical-align:top; text-align:right; }
+  th { background:#f2f2f2; position:sticky; top:0; }
+  .ok { color:#087a28; font-weight:bold; }
+  .bad { color:#b00020; font-weight:bold; }
+  .warn { color:#9a6500; font-weight:bold; }
+  .mono { font-family: Consolas, monospace; direction:ltr; text-align:left; white-space:pre-wrap; }
+  #map { height:360px; border:1px solid #ccc; margin-top:10px; }
+  #log { max-height:300px; overflow:auto; background:#111; color:#eee; padding:10px; }
+  .small { font-size:12px; color:#555; }
+</style>
+</head>
+<body>
+<h1>GovMap Layer Lab</h1>
+
+<div class="card">
+  <div><b>Origin:</b> <span id="origin"></span></div>
+  <div class="small">הרץ את הקובץ דרך https://ronmarom12.github.io ולא כ-file:// כדי שהדפדפן ישלח Origin תקין.</div>
+  <p>
+    <label><b>GovMap token:</b></label><br>
+    <input id="token" type="password" autocomplete="off" placeholder="הדבק כאן את ה-token. הוא לא נשמר בקובץ.">
+  </p>
+  <button onclick="initSdk()">1. בדיקת SDK + Geocode</button>
+  <button onclick="runAll()">2. הרץ את כל בדיקות השכבות</button>
+  <button onclick="downloadReport()">הורד דו"ח JSON</button>
+  <span id="status"></span>
+  <div id="map"></div>
+</div>
+
+<div class="card">
+<h2>תוצאות</h2>
+<div style="overflow:auto; max-height:650px">
+<table id="tbl">
+<thead>
+<tr>
+<th>קבוצה</th>
+<th>Layer ID</th>
+<th>מקור הזיהוי</th>
+<th>Metadata</th>
+<th>Spatial token test</th>
+<th>ת"א</th>
+<th>ירושלים</th>
+<th>חיפה</th>
+<th>ב"ש</th>
+<th>מקסימום רשומות</th>
+<th>שדות לדוגמה</th>
+<th>Caption</th>
+<th>GovMap</th>
+</tr>
+</thead>
+<tbody></tbody>
+</table>
+</div>
+</div>
+
+<div class="card">
+<h2>לוג</h2>
+<pre id="log" class="mono"></pre>
+</div>
+
+<script>
+document.getElementById("origin").textContent = window.location.origin;
+let REPORT = {startedAt:null, origin:window.location.origin, geocode:null, groups:[], rawSearch:{}};
+
+const GROUPS = [
+  {label:"תחנות אוטובוס", terms:["תחנת אוטובוס","אוטובוס"], ids:["bus_stops"]},
+  {label:"תחנות רכבת", terms:["תחנת רכבת","רכבת ישראל"], ids:["rail_stat","train_station","train_stations"]},
+  {label:"מקלטים / מרחבים מוגנים", terms:["מקלט","מרחב מוגן","מיגונית"], ids:["BOMBSHELTERS"]},
+  {label:"דפיברילטורים", terms:["דפיברילטור","AED"], ids:["DEFI"]},
+  {label:"תחנות דלק", terms:["תחנת דלק"], ids:["GASSTATIONS","t_delek"]},
+  {label:"מסעדות", terms:["מסעדה","מסעדות"], ids:["restaurants","RESTAURANTS"]},
+  {label:"צמתים מרומזרים", terms:["צומת מרומזר","רמזור"], ids:["traffic_light_junction","TRAFFIC_LIGHT_JUNCTION"]},
+  {label:"פחים כתומים", terms:["פח כתום","פחים כתומים"], ids:["ORANGE_TRASH"]}
+];
+
+const PLACES = [
+  {name:"תל אביב", lat:32.0853, lon:34.7818},
+  {name:"ירושלים", lat:31.7683, lon:35.2137},
+  {name:"חיפה", lat:32.7940, lon:34.9896},
+  {name:"באר שבע", lat:31.25297, lon:34.79146}
+];
+
+function log(x) {
+  const el = document.getElementById("log");
+  el.textContent += `[${new Date().toLocaleTimeString()}] ${x}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+function mercator(lat, lon){
+  const x = lon * 20037508.34 / 180;
+  let y = Math.log(Math.tan((90 + lat) * Math.PI / 360)) / (Math.PI / 180);
+  y = y * 20037508.34 / 180;
+  return [x,y];
+}
+async function fetchJson(url, opts={}){
+  const r = await fetch(url, opts);
+  const text = await r.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}: ${typeof data==="string" ? data : JSON.stringify(data)}`);
+  return data;
+}
+
+async function initSdk(){
+  const token = document.getElementById("token").value.trim();
+  if(!token){ alert("הדבק token קודם"); return; }
+  document.getElementById("status").textContent = "בודק...";
+  try{
+    await govmap.createMap("map", {
+      token,
+      showXY:true,
+      identifyOnClick:true,
+      isEmbeddedToggle:false
+    });
+    const g = await govmap.geocode({keyword:"דיזנגוף 100 תל אביב"}, govmap.geocodeType.FullResult);
+    REPORT.geocode = g;
+    document.getElementById("status").innerHTML = '<span class="ok">SDK + GEOCODE SUCCESS</span>';
+    log("SDK + geocode הצליחו.");
+  }catch(e){
+    REPORT.geocode = {error:String(e)};
+    document.getElementById("status").innerHTML = '<span class="bad">SDK/GEOCODE FAILED</span>';
+    log("SDK/geocode נכשל: "+e);
+  }
+}
+
+async function discoverLayerIds(group){
+  const found = [];
+  REPORT.rawSearch[group.label] = [];
+  for(const term of group.terms){
+    try{
+      const data = await fetchJson("https://www.govmap.gov.il/api/search-service/autocomplete", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({searchText:term, language:"he", maxResults:30})
+      });
+      REPORT.rawSearch[group.label].push({term,data});
+      for(const item of (data?.results || [])){
+        if(item.layerId !== undefined && item.layerId !== null){
+          found.push(String(item.layerId));
+        }
+      }
+      log(`Search "${term}": ${data?.resultsCount ?? "?"} results, layerIds=${[...new Set(found)].join(",") || "none"}`);
+    }catch(e){
+      REPORT.rawSearch[group.label].push({term,error:String(e)});
+      log(`Search "${term}" failed: ${e}`);
+    }
+    await sleep(250);
+  }
+  return [...new Set(found)];
+}
+
+async function metadata(layerId){
+  try{
+    const data = await fetchJson(`https://www.govmap.gov.il/api/layers-catalog/layer/${encodeURIComponent(layerId)}/metadata`);
+    return {ok:!!data, data};
+  }catch(e){ return {ok:false,error:String(e)}; }
+}
+
+async function entities(layerId, place, radius){
+  const point = mercator(place.lat, place.lon);
+  try{
+    const data = await fetchJson("https://www.govmap.gov.il/api/layers-catalog/entitiesByPoint", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        point,
+        layers:[{layerId}],
+        tolerance:radius,
+        calculateDistance:true,
+        language:"he"
+      })
+    });
+    const lr = data?.data?.[0] || null;
+    return {
+      ok:true,
+      count:lr?.entities?.length || 0,
+      caption:lr?.caption || null,
+      name:lr?.name || null,
+      fieldsMapping:lr?.fieldsMapping || null,
+      entities:lr?.entities || []
+    };
+  }catch(e){ return {ok:false,error:String(e),count:0}; }
+}
+
+async function spatialTokenTest(layerId, fieldNames){
+  const token = document.getElementById("token").value.trim();
+  if(!token) return {ok:false, skipped:true, error:"No token entered"};
+  const [x,y] = mercator(32.0853,34.7818);
+  try{
+    const data = await fetchJson("https://www.govmap.gov.il/api/spatial-analysis/layer-features-by-location", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        data:{
+          geometry:`POINT(${x} ${y})`,
+          radius:5000,
+          layers:[{name:layerId, fields:(fieldNames||[]).slice(0,10)}]
+        },
+        apiToken:token
+      })
+    });
+    return {ok:true,data};
+  }catch(e){ return {ok:false,error:String(e)}; }
+}
+
+function fieldNamesFrom(meta, sample){
+  const a = Object.keys(meta?.data?.fields || {});
+  if(a.length) return a;
+  const ent = sample?.entities?.[0];
+  if(ent?.fields) return ent.fields.map(f=>f.fieldName).filter(Boolean);
+  return [];
+}
+
+function esc(s){
+  return String(s ?? "").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function renderRow(r){
+  const tr = document.createElement("tr");
+  const counts = {};
+  for(const p of r.places) counts[p.place] = p.bestCount;
+  tr.innerHTML = `
+    <td>${esc(r.group)}</td>
+    <td class="mono">${esc(r.layerId)}</td>
+    <td>${esc(r.source)}</td>
+    <td class="${r.metadata.ok?"ok":"warn"}">${r.metadata.ok?"YES":"NO/NULL"}</td>
+    <td class="${r.spatial?.ok?"ok":(r.spatial?.skipped?"warn":"bad")}">${r.spatial?.ok?"YES":(r.spatial?.skipped?"SKIP":"NO")}</td>
+    <td>${counts["תל אביב"] ?? 0}</td>
+    <td>${counts["ירושלים"] ?? 0}</td>
+    <td>${counts["חיפה"] ?? 0}</td>
+    <td>${counts["באר שבע"] ?? 0}</td>
+    <td class="${r.maxCount>=100?"warn":""}">${r.maxCount}${r.maxCount>=100?" (CAP?)":""}</td>
+    <td class="mono">${esc(r.fields.slice(0,12).join(", "))}</td>
+    <td>${esc(r.caption || "")}</td>
+    <td><a target="_blank" href="https://www.govmap.gov.il/?z=6&lay=${encodeURIComponent(r.layerId)}">פתח</a></td>`;
+  document.querySelector("#tbl tbody").appendChild(tr);
+}
+
+async function testCandidate(groupLabel, layerId, source){
+  log(`Testing ${groupLabel}: ${layerId}`);
+  const md = await metadata(layerId);
+  await sleep(250);
+
+  const placeResults = [];
+  let maxCount = 0, sample = null, caption = null;
+
+  for(const place of PLACES){
+    let best = {count:0};
+    for(const radius of [1000,5000]){
+      const q = await entities(layerId, place, radius);
+      await sleep(250);
+      if(q.ok && q.count >= best.count) best = {...q, radius};
+      if(q.ok && q.count > maxCount){
+        maxCount = q.count; sample = q;
+      }
+      if(q.caption && !caption) caption = q.caption;
+    }
+    placeResults.push({place:place.name, bestCount:best.count||0, bestRadius:best.radius||null, raw:best});
+  }
+
+  const fields = fieldNamesFrom(md, sample);
+  const spatial = await spatialTokenTest(layerId, fields);
+  await sleep(250);
+
+  const row = {
+    group:groupLabel, layerId, source, metadata:md, spatial,
+    places:placeResults, maxCount, caption, fields,
+    sampleEntity:sample?.entities?.[0] || null
+  };
+  renderRow(row);
+  return row;
+}
+
+async function runAll(){
+  REPORT = {startedAt:new Date().toISOString(), origin:window.location.origin, geocode:REPORT.geocode, groups:[], rawSearch:{}};
+  document.querySelector("#tbl tbody").innerHTML="";
+  document.getElementById("log").textContent="";
+  document.getElementById("status").textContent="מריץ...";
+
+  for(const group of GROUPS){
+    log(`=== ${group.label} ===`);
+    const discovered = await discoverLayerIds(group);
+    const all = [];
+    for(const id of group.ids) all.push({id,source:"known/candidate"});
+    for(const id of discovered) if(!all.some(x=>x.id===id)) all.push({id,source:"search-discovered"});
+
+    const gr = {label:group.label, discovered, candidates:[]};
+    for(const c of all){
+      const result = await testCandidate(group.label,c.id,c.source);
+      gr.candidates.push(result);
+    }
+    REPORT.groups.push(gr);
+  }
+  document.getElementById("status").innerHTML='<span class="ok">DONE</span>';
+  log("All tests completed.");
+}
+
+function downloadReport(){
+  const blob = new Blob([JSON.stringify(REPORT,null,2)], {type:"application/json;charset=utf-8"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "govmap-layer-lab-report.json";
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+</script>
+</body>
+</html>
